@@ -9,6 +9,7 @@
 
 ### VS Code ###
 .vscode/
+.VSCodeCounter/
 
 .ipynb_checkpoints
 
@@ -22,3 +23,6 @@
 *.pkl
 *.txt
 *.mp3
+
+###
+bert_exp/data_dir
