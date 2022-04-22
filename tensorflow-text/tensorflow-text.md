@@ -16,6 +16,10 @@
       - [offset](#offset)
       - [detokenization](#detokenization)
       - [对tf.data.Dataset对象使用tokenizer](#对tfdatadataset对象使用tokenizer)
+    - [subword tokenizer](#subword-tokenizer)
+      - [通过tf.data.Dataset生成bert_vocab](#通过tfdatadataset生成bert_vocab)
+      - [基于vocab生成BertTokenizer](#基于vocab生成berttokenizer)
+    - [BERT preprocessing](#bert-preprocessing)
   - [BERT Experiments](#bert-experiments)
 # tensorflow-text部分目录
 
@@ -132,7 +136,12 @@ WordpieceTokenizer期望接受一个分割后的tokens作为输入进行数据�
 本质就是对vocab文件的映射  
 2. BertTokenizer
 BertTokenizer实现了BERT论文中的实现方法，本质是由WordPieceTokenizer支持的 但是还执行其他任务 如单词规范化和标记化  
-本质还是对vocab文件的映射  
+值得注意的是BertTokenizer中有可能对一个word进行分割到sub-word，例如"Average" -> "A" "##ven" "##ger"  
+这是因为vocab表中有词根的概念 ##+characters 表示了一个词根 那么就可以将一个词进行分割  
+输入是[batch, num_tokens(一个句子中词的个数)]  
+输出是[batch, num_tokens(一个句子中词的个数 这个和输入完全相同), num_wordpieces(**这个维度是每个word用分成了几维 有可能是1 即没有分割为sub-word 但是也会被分成词根 那么就是多维**)]  
+部分任务需要保留num_wordpieces维，大部分任务不需要，就可以直接将其合并为[batch, new_num_tokens] 方法为merge_dims(-2,-1)  
+本质还是对vocab文件的映射(注意词根 ##+字母的模式)  
 3. SentencepieceTokenizer
 SentencepieceTokenizer是基于sentencepiece库的 这个方法是根据输入数据快速迭代的 有很明显的sub-word的效果 见ML_tools仓库[ML_tools](https://github.com/MMMMysticY/ML_tools/tree/master/NLP/sentencepiece)
 #### 其他Tokenizer
@@ -159,6 +168,57 @@ tokenize的逆操作 但是并不是所有的tokenizer都有这个方法
 
 #### 对tf.data.Dataset对象使用tokenizer
 使用map(lambda x: tokenizer.tokenize(x))方法  
+
+### subword tokenizer
+有几个实用的方法：
+#### 通过tf.data.Dataset生成bert_vocab
+```python
+from tensorflow_text.tools.wordpiece_vocab import bert_vocab_from_dataset as bert_vocab
+pt_vocab = bert_vocab.bert_vocab_from_dataset()
+```
+见[bert_vocab](pre-processing/subword_tokenizers.ipynb)  
+#### 基于vocab生成BertTokenizer
+这个和上一部分subword小节中BertTokenizer一样  
+但是值得注意几个方法  
+```python
+tf.gather(vocab_txt, token_int) # 这个方法可以简单地将int值映射到vocab_txt文件中的字符上
+tf.strings.reduce_join(text_tokens, separator=' ', axis=-1) # 这个方法可以将维度内的各个值合并 以空格分隔
+(RaggedTensor).merge_dims(-2,-1) # 这个方法很有用 因为BERT tokenize之后的结果是一个RaggedTensor是 [batch, seq_len, N] 最后这个N很多情况下等于1在有些情况没有意义 可以直接合并
+
+bad_cells = tf.strings.regex_full_match(token_txt, bad_token_re)
+result = tf.ragged.boolean_mask(token_txt, ~bad_cells)
+# 这个方法可以进行正则匹配删去特定tokens
+```
+还有CustomTokenizer方法  
+见[BertTokenizer后续处理](pre-processing/subword_tokenizers.ipynb)  
+
+### BERT preprocessing
+使用丰富的tensorflow_text的api 完成BERT任务 即Masked language model + next sentence prediction  
+基本方法是：
+1. Input是tf.string类型的**Tensor** 其中有text_a text_b  
+   维度：每个text_a和text_b的维度是[batch, 1]  
+   方法：tf.data.Dataset.from_tensors   
+2. 将Input进行Tokenizer **按照vocab初始化BertTokenizer**  
+   维度：每个text_a text_b 维度变成[batch, num_words, wordpieces] 即将一个句子分成word 再把word分成wordpieces  
+   方法：tf.lookup.StaticVocabularyTable初始化lookup对象， 作为参数初始化text.BertTokenizer 之后调用tokenize方法  
+3. 本任务无需wordpieces单独处理 所以将每个text_a text_b最后两维合并  
+   维度：text_a text_b维度变成[batch, num_wordpieces] 
+   方法：merge_dims(-2,-1)  
+4. 将两个句子裁剪为MAX_SEQ_LEN以内  
+   维度：text_a变成[batch, num_wordpieces_a] text_b变成[batch, num_wordpiece_b] 其中num_wordpieces_a + num_wordpiece_b <= MAX_SEQ_LEN  
+   方法：text.RoundRobinTrimmer trim方法  
+5. 将text_a text_b 进行拼接 并加上SOS和EOS  
+   维度：输出的combined_segments是text_a和text_b合并的整体结果 [batch, seq_len] seq_len = 3 + num_wordpieces_a + num_wordpiece_b  同时还有一个输出segment_ids进行text_a和text_b的区分，0代表text_a 1代表text_b 维度也是[batch, seq_len]  
+   方法：text.combine_segments  
+6. 进行mask 随机选择mask的位置和mask的value 进行mask  
+   维度：masked_input_ids是combined_segments进行mask的结果 维度是[batch, seq_len] 不变 因为只有mask行为 masked_positions和masked_ids是被mask的位置和原始真实的ids，维度是[batch, masked_len]  
+   方法：mask位置的随机选择器text.RandomItemSelector mask位置的处理方法值的选取text.MaskValuesChooser 进行mask的方法text.mask_language_model  
+7. 进行pad到MAX_SEQ_LEN 和 MAX_PREDICTION_LEN  
+   维度：masked_input_ids 和 segment_ids pad到 MAX_SEQ_LEN masked_positions和masked_ids pad到MAX_PREDICTION_LEN  
+   方法：text.pad_model_inputs  
+8. 用上面所有东西作为inputs
+
+详细见[BERT-preprocessing](pre-processing/BERT-preprocessing.ipynb)  
 
 ## BERT Experiments
 使用BERT进行基本的fine-tune任务的步骤是：
